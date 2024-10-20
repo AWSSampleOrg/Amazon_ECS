@@ -1,0 +1,182 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: ECS on Fargate
+# ------------------------------------------------------------#
+# Input Parameters
+# ------------------------------------------------------------#
+Parameters:
+  ProjectPrefix:
+    Type: String
+    Default: ""
+
+  # VPC
+  VpcId:
+    Type: String
+  PublicSubnetAId:
+    Type: String
+  PublicSubnetCId:
+    Type: String
+
+  # ECS
+  # Cluster
+  EcsClusterName:
+    Type: String
+    Default: Cluster
+  # Service
+  EcsAppServiceName:
+    Type: String
+    Default: Application
+  # Container
+  EcsAppContainerName:
+    Type: String
+    Default: app
+
+Resources:
+  # ------------------------------------------------------------#
+  # Cloud Watch Log Group
+  # ------------------------------------------------------------#
+  EcsAppContainerLogGroup:
+    Type: "AWS::Logs::LogGroup"
+    Properties:
+      LogGroupName: !Sub /ecs/logs/${ProjectPrefix}${EcsAppContainerName}
+
+  # ------------------------------------------------------------#
+  # Security Groups for ECS Service
+  # ------------------------------------------------------------#
+  SecurityGroupForAppService:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${ProjectPrefix}SecurityGroupForAppService
+      GroupDescription: This is for SecurityGroupForAppService
+      VpcId: !Ref VpcId
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectPrefix}SecurityGroupForAppService
+
+  # ------------------------------------------------------------#
+  # ECS
+  # ------------------------------------------------------------#
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub ${ProjectPrefix}${EcsClusterName}
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectPrefix}${EcsClusterName}
+
+  EcsAppTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    DependsOn:
+      - EcsAppContainerLogGroup
+    Properties:
+      ContainerDefinitions:
+        #app
+        - Essential: true
+          Environment:
+            - Name: LOG_LEVEL
+              Value: DEBUG
+            - Name: DefaultRegion
+              Value: !Sub ${AWS::Region}
+          Image: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/app:latest
+          PortMappings:
+            - ContainerPort: 3000
+              HostPort: 3000
+              Protocol: tcp
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref EcsAppContainerLogGroup
+              awslogs-region: !Sub ${AWS::Region}
+              awslogs-stream-prefix: ecs
+          Name: !Sub ${ProjectPrefix}${EcsAppContainerName}
+      Cpu: 256
+      ExecutionRoleArn: !Sub ${EcsTaskRole.Arn}
+      Family: app
+      Memory: 512
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      TaskRoleArn: !Sub ${EcsTaskRole.Arn}
+
+  #Application Service
+  EcsAppService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref EcsCluster
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 100
+      DeploymentController:
+        # Type: CODE_DEPLOY #Blue/Green Deploy
+        Type: ECS
+      DesiredCount: 1
+      EnableExecuteCommand: true
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups:
+            - !Ref SecurityGroupForAppService
+          Subnets:
+            - !Ref PublicSubnetAId
+            - !Ref PublicSubnetCId
+      PlatformVersion: LATEST
+      SchedulingStrategy: REPLICA
+      ServiceName: !Sub ${ProjectPrefix}${EcsAppServiceName}
+      TaskDefinition: !Ref EcsAppTaskDefinition
+
+  # ------------------------------------------------------------#
+  # Auto Scaling Service
+  # ------------------------------------------------------------#
+  EcsAppServiceScalingTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    DependsOn:
+      - EcsAppService
+    Properties:
+      MinCapacity: 1
+      MaxCapacity: 2
+      ResourceId: !Join
+        - /
+        - - service
+          - !Ref EcsCluster
+          - !GetAtt EcsAppService.Name
+      RoleARN: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-service-role/ecs.application-autoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_ECSService
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+
+  EcsAppServiceScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub "${ProjectPrefix}${EcsAppServiceName}-ScalingPolicy"
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref EcsAppServiceScalingTarget
+      TargetTrackingScalingPolicyConfiguration:
+        DisableScaleIn: false
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        ScaleInCooldown: 60
+        ScaleOutCooldown: 60
+        TargetValue: 70.0
+
+  # ------------------------------------------------------------#
+  # IAM
+  # ------------------------------------------------------------#
+  EcsTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess
+      Path: /
+      RoleName: !Sub ${ProjectPrefix}EcsTaskRole

@@ -1,0 +1,631 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: ECS on EC2 (public subnets) - container instance disk / log verification
+# ------------------------------------------------------------#
+# Input Parameters
+# ------------------------------------------------------------#
+Parameters:
+  ProjectPrefix:
+    Type: String
+    Default: ""
+  # VPC
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  PublicSubnetAId:
+    Type: AWS::EC2::Subnet::Id
+  PublicSubnetCId:
+    Type: AWS::EC2::Subnet::Id
+  # ECS
+  # Cluster
+  EcsClusterName:
+    Type: String
+    Default: Cluster
+  # Service
+  EcsAppServiceName:
+    Type: String
+    Default: Application
+  # Task Definition
+  EcsAppTaskName:
+    Type: String
+    Default: app
+  # Image
+  EcsAppImageName:
+    Type: String
+    Default: app
+  # Container
+  EcsAppContainerName:
+    Type: String
+    Default: app
+  # Only used by the ALB and the container PortMappings, both commented out below
+  # EcsAppContainerPort:
+  #   Type: Number
+  #   Default: 3000
+  EcsAppTaskCpu:
+    Type: Number
+    Default: 256
+  EcsAppTaskMemory:
+    Type: Number
+    Default: 512
+  EcsAppDesiredCount:
+    Type: Number
+    Default: 1
+  HostLogPath:
+    Description: >-
+      Bind mount path, used identically inside the container and on the host.
+      Matches the customer task definition. main.py writes its log file here, so
+      this is what grows, not /var/lib/docker.
+    Type: String
+    Default: /data/application/logs
+  # The log generator rate is a plain constant at the top of main.py, so it is not
+  # a template parameter.
+  # ------------------------------------------------------------#
+  # Container Instance (EC2)
+  # ------------------------------------------------------------#
+  EcsInstanceAmiId:
+    Description:
+    Type: AWS::SSM::Parameters::Value<AWS::EC2::Image::Id>
+    Description: "Select the SSM Parameter path for the ECS Optimized AMI."
+    Default: "/aws/service/ecs/optimized-ami/amazon-linux-2023/recommended/image_id"
+    AllowedValues:
+      # Amazon Linux 2023
+      - "/aws/service/ecs/optimized-ami/amazon-linux-2023/recommended/image_id"
+      - "/aws/service/ecs/optimized-ami/amazon-linux-2023/arm64/recommended/image_id"
+      - "/aws/service/ecs/optimized-ami/amazon-linux-2023/gpu/recommended/image_id"
+      # Amazon Linux 2
+      - "/aws/service/ecs/optimized-ami/amazon-linux-2/recommended/image_id"
+      - "/aws/service/ecs/optimized-ami/amazon-linux-2/arm64/recommended/image_id"
+      - "/aws/service/ecs/optimized-ami/amazon-linux-2/gpu/recommended/image_id"
+      # Bottlerocket
+      - "/aws/service/bottlerocket/aws-ecs-2/x86_64/latest/image_id"
+      - "/aws/service/bottlerocket/aws-ecs-2/aarch64/latest/image_id"
+
+  EcsInstanceType:
+    Description: Matches the instance type used by the customer
+    Type: String
+    Default: t3.medium
+  EcsInstanceRootVolumeSize:
+    Description: Root volume size in GiB. Docker/containerd data (/var/lib/docker) lives here.
+    Type: Number
+    Default: 30
+  EcsInstanceRootVolumeType:
+    Type: String
+    Default: gp3
+    AllowedValues: [gp2, gp3]
+  EcsInstanceMinSize:
+    Type: Number
+    Default: 1
+  EcsInstanceMaxSize:
+    Type: Number
+    Default: 2
+  EcsInstanceDesiredCapacity:
+    Type: Number
+    Default: 1
+  # ------------------------------------------------------------#
+  # ECS container agent configuration (/etc/ecs/ecs.config)
+  # These are the knobs that decide when the agent frees up
+  # container instance storage used by stopped tasks / images.
+  # See: https://docs.aws.amazon.com/AmazonECS/latest/developerguide/ecs-agent-config.html
+  # ------------------------------------------------------------#
+  EcsAgentLogLevel:
+    Type: String
+    Default: info
+    AllowedValues: [debug, info, warn, error, crit]
+  EcsEngineTaskCleanupWaitDuration:
+    Description: How long the agent keeps containers (and their json-file logs) of a STOPPED task. Default 3h.
+    Type: String
+    Default: 3h
+  EcsDisableImageCleanup:
+    Description: Set to true to turn off automated image cleanup.
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+  EcsImageCleanupInterval:
+    Description: How often the image cleanup process runs. Default 30m, minimum 10m.
+    Type: String
+    Default: 30m
+  EcsImageMinimumCleanupAge:
+    Description: Minimum age of a pulled image before it becomes a cleanup candidate. Default 1h.
+    Type: String
+    Default: 1h
+  EcsNumImagesDeletePerCycle:
+    Description: Images removed per cleanup cycle. Default 5, minimum 1.
+    Type: String
+    Default: "5"
+  EcsImagePullBehavior:
+    Type: String
+    Default: default
+    AllowedValues: [default, always, once, prefer-cached]
+  EcsReservedMemory:
+    Description: MiB of memory reserved for the ECS agent and other host processes.
+    Type: Number
+    Default: 128
+  # ------------------------------------------------------------#
+  # Log driver
+  # ------------------------------------------------------------#
+  LogDriver:
+    Description: >-
+      awslogs streams to CloudWatch Logs and keeps almost nothing on the host.
+      json-file keeps the log on the container instance disk, which is what makes
+      the host disk grow. Use json-file to reproduce disk growth.
+    Type: String
+    Default: awslogs
+    AllowedValues: [awslogs, json-file]
+  JsonFileLogMaxSize:
+    Description: >-
+      max-size log option of the json-file driver for the task.
+      EMPTY means no rotation, so the log grows until the task stops. That is the
+      state to reproduce. Setting it (for example 10m) is the mitigation, because
+      the log is then capped at max-size x max-file per container.
+    Type: String
+    Default: ""
+  JsonFileLogMaxFile:
+    Description: max-file log option of the json-file driver. Only used when JsonFileLogMaxSize is set.
+    Type: String
+    Default: "3"
+  DockerDefaultLogMaxSize:
+    Description: >-
+      Host-wide docker daemon default (/etc/docker/daemon.json) log rotation size.
+      Leave empty to keep the AMI default (no rotation).
+    Type: String
+    Default: ""
+  DockerDefaultLogMaxFile:
+    Description: Host-wide docker daemon default number of rotated log files. Leave empty to keep the AMI default.
+    Type: String
+    Default: ""
+  # ------------------------------------------------------------#
+  # Monitoring
+  # ------------------------------------------------------------#
+  EnableCloudWatchAgent:
+    Description: Install the CloudWatch agent to publish disk_used_percent / disk_used of the root volume.
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+  # ServiceAutoScaling, commented out below
+  # TaskMinContainerCount:
+  #   Type: Number
+  #   Default: 1
+  # TaskMaxContainerCount:
+  #   Type: Number
+  #   Default: 2
+Conditions:
+  UseJsonFileLogDriver: !Equals [!Ref LogDriver, "json-file"]
+  # No max-size means the json-file log is never rotated
+  RotateJsonFileLog: !And
+    - !Condition UseJsonFileLogDriver
+    - !Not [!Equals [!Ref JsonFileLogMaxSize, ""]]
+
+Resources:
+  # ------------------------------------------------------------#
+  # ALB  --  NOT REQUIRED for this verification
+  #
+  # AWS::ECS::Service does not require the LoadBalancers property, so the whole
+  # ALB stack below is unnecessary. The container generates its logs on its own
+  # (see the Burn* parameters), so no inbound HTTP path is needed. Logs are
+  # produced without any request, and you reach the container with ECS Exec
+  # (EnableExecuteCommand) and the host with Session Manager.
+  #
+  # Uncomment this block, the LoadBalancers / HealthCheckGracePeriodSeconds /
+  # DependsOn Listener lines in EcsAppService, the SecurityGroupIngress of
+  # SecurityGroupForEcsInstance, and the AlbDnsName output if you want to drive
+  # the container over HTTP instead (curl "http://<alb-dns>/burn?mb=500").
+  # ------------------------------------------------------------#
+  # SecurityGroupForALB:
+  #   Type: AWS::EC2::SecurityGroup
+  #   Properties:
+  #     GroupName: !Sub ${ProjectPrefix}Ec2SecurityGroupForALB
+  #     GroupDescription: This is for SecurityGroupForALB
+  #     VpcId: !Ref VpcId
+  #     SecurityGroupIngress:
+  #       - CidrIp: "0.0.0.0/0"
+  #         Description: This is for ALB
+  #         FromPort: 80
+  #         IpProtocol: tcp
+  #         ToPort: 80
+  #     Tags:
+  #       - Key: Name
+  #         Value: !Sub ${ProjectPrefix}Ec2SecurityGroupForALB
+  # Listener:
+  #   Type: AWS::ElasticLoadBalancingV2::Listener
+  #   Properties:
+  #     DefaultActions:
+  #       - TargetGroupArn: !Ref TargetGroup
+  #         Type: forward
+  #     LoadBalancerArn: !Ref ALB
+  #     Port: 80
+  #     Protocol: HTTP
+  # ALB:
+  #   Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+  #   Properties:
+  #     IpAddressType: ipv4
+  #     Name: !Sub ${ProjectPrefix}Ec2LoadBalancer
+  #     Scheme: internet-facing
+  #     SecurityGroups:
+  #       - !Ref SecurityGroupForALB
+  #     Subnets:
+  #       - !Ref PublicSubnetAId
+  #       - !Ref PublicSubnetCId
+  #     Type: application
+  # NetworkMode of the task definition is bridge with a dynamic host port,
+  # so the target is the container instance itself (TargetType: instance).
+  # TargetGroup:
+  #   Type: AWS::ElasticLoadBalancingV2::TargetGroup
+  #   Properties:
+  #     HealthCheckEnabled: true
+  #     HealthCheckIntervalSeconds: 60
+  #     HealthCheckPath: /healthcheck
+  #     HealthCheckPort: traffic-port
+  #     HealthCheckProtocol: HTTP
+  #     HealthCheckTimeoutSeconds: 30
+  #     HealthyThresholdCount: 5
+  #     Matcher:
+  #       HttpCode: 200-301
+  #     Name: !Sub ${ProjectPrefix}Ec2TargetGroup
+  #     Port: !Ref EcsAppContainerPort
+  #     Protocol: HTTP
+  #     TargetGroupAttributes:
+  #       - Key: deregistration_delay.timeout_seconds
+  #         Value: "30"
+  #     TargetType: instance
+  #     UnhealthyThresholdCount: 3
+  #     VpcId: !Ref VpcId
+  # ------------------------------------------------------------#
+  # Cloud Watch Log Group
+  # ------------------------------------------------------------#
+
+  EcsAppContainerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/logs/${ProjectPrefix}ec2${EcsAppContainerName}
+  # ------------------------------------------------------------#
+  # Security Group for the container instances
+  # ------------------------------------------------------------#
+  SecurityGroupForEcsInstance:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${ProjectPrefix}Ec2SecurityGroupForEcsInstance
+      GroupDescription: This is for the ECS container instances
+      VpcId: !Ref VpcId
+      # No inbound rule is needed without the ALB. The container is reached with
+      # ECS Exec and the host with Session Manager, both of which are outbound only.
+      # SecurityGroupIngress:
+      #   # bridge network mode assigns an ephemeral host port to the container
+      #   - Description: Ephemeral port range for dynamic port mapping from the ALB
+      #     FromPort: 32768
+      #     ToPort: 65535
+      #     IpProtocol: tcp
+      #     SourceSecurityGroupId: !Ref SecurityGroupForALB
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectPrefix}Ec2SecurityGroupForEcsInstance
+  # ------------------------------------------------------------#
+  # ECS Cluster
+  # ------------------------------------------------------------#
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub ${ProjectPrefix}Ec2${EcsClusterName}
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectPrefix}Ec2${EcsClusterName}
+  # ------------------------------------------------------------#
+  # Container Instances (Launch Template + Auto Scaling Group)
+  # ------------------------------------------------------------#
+  EcsInstanceLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub ${ProjectPrefix}Ec2EcsInstanceLaunchTemplate
+      LaunchTemplateData:
+        ImageId: !Ref EcsInstanceAmiId
+        InstanceType: !Ref EcsInstanceType
+        IamInstanceProfile:
+          Arn: !GetAtt EcsInstanceProfile.Arn
+        MetadataOptions:
+          HttpTokens: required
+          HttpPutResponseHopLimit: 2
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              DeleteOnTermination: true
+              Encrypted: true
+              VolumeSize: !Ref EcsInstanceRootVolumeSize
+              VolumeType: !Ref EcsInstanceRootVolumeType
+        NetworkInterfaces:
+          - DeviceIndex: 0
+            AssociatePublicIpAddress: true
+            Groups:
+              - !Ref SecurityGroupForEcsInstance
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub ${ProjectPrefix}Ec2EcsInstance
+        UserData:
+          Fn::Base64: !Sub |
+            #!/usr/bin/env bash
+            set -x
+            exec >> /var/log/user-data.log 2>&1
+            # ------------------------------------------------------------#
+            # ECS container agent configuration
+            # ------------------------------------------------------------#
+            {
+              echo "ECS_CLUSTER=${ProjectPrefix}Ec2${EcsClusterName}"
+              echo "ECS_LOGLEVEL=${EcsAgentLogLevel}"
+              echo "ECS_ENABLE_CONTAINER_METADATA=true"
+              echo "ECS_RESERVED_MEMORY=${EcsReservedMemory}"
+              echo "ECS_ENGINE_TASK_CLEANUP_WAIT_DURATION=${EcsEngineTaskCleanupWaitDuration}"
+              echo "ECS_DISABLE_IMAGE_CLEANUP=${EcsDisableImageCleanup}"
+              echo "ECS_IMAGE_CLEANUP_INTERVAL=${EcsImageCleanupInterval}"
+              echo "ECS_IMAGE_MINIMUM_CLEANUP_AGE=${EcsImageMinimumCleanupAge}"
+              echo "ECS_NUM_IMAGES_DELETE_PER_CYCLE=${EcsNumImagesDeletePerCycle}"
+              echo "ECS_IMAGE_PULL_BEHAVIOR=${EcsImagePullBehavior}"
+              echo 'ECS_AVAILABLE_LOGGING_DRIVERS=["json-file","awslogs","awsfirelens"]'
+            } >> /etc/ecs/ecs.config
+            # ------------------------------------------------------------#
+            # Host wide docker json-file log rotation (optional)
+            # The ECS agent does NOT rotate container logs. Without this,
+            # a json-file log grows until the task is stopped and cleaned up.
+            # ------------------------------------------------------------#
+            DOCKER_LOG_MAX_SIZE="${DockerDefaultLogMaxSize}"
+            DOCKER_LOG_MAX_FILE="${DockerDefaultLogMaxFile}"
+            if [ -n "$DOCKER_LOG_MAX_SIZE" ] && [ -n "$DOCKER_LOG_MAX_FILE" ]; then
+              mkdir -p /etc/docker
+              cat <<EOF > /etc/docker/daemon.json
+            {
+              "log-driver": "json-file",
+              "log-opts": {
+                "max-size": "$DOCKER_LOG_MAX_SIZE",
+                "max-file": "$DOCKER_LOG_MAX_FILE"
+              }
+            }
+            EOF
+              systemctl restart docker || true
+              systemctl restart ecs || true
+            fi
+            # ------------------------------------------------------------#
+            # CloudWatch agent for disk usage metrics (optional)
+            # ------------------------------------------------------------#
+            if [ "${EnableCloudWatchAgent}" = "true" ]; then
+              dnf install -y amazon-cloudwatch-agent || yum install -y amazon-cloudwatch-agent || true
+              mkdir -p /opt/aws/amazon-cloudwatch-agent/etc
+              cat <<'EOF' > /opt/aws/amazon-cloudwatch-agent/etc/cwagent-disk.json
+            {
+              "agent": {
+                "metrics_collection_interval": 60
+              },
+              "metrics": {
+                "namespace": "EcsOnEc2/ContainerInstance",
+                "append_dimensions": {
+                  "InstanceId": "${!aws:InstanceId}",
+                  "AutoScalingGroupName": "${!aws:AutoScalingGroupName}"
+                },
+                "metrics_collected": {
+                  "disk": {
+                    "resources": ["/"],
+                    "measurement": ["used_percent", "used", "total"],
+                    "metrics_collection_interval": 60
+                  },
+                  "mem": {
+                    "measurement": ["mem_used_percent"],
+                    "metrics_collection_interval": 60
+                  }
+                }
+              }
+            }
+            EOF
+              /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+                -a fetch-config -m ec2 -s \
+                -c file:/opt/aws/amazon-cloudwatch-agent/etc/cwagent-disk.json || true
+            fi
+  EcsInstanceAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub ${ProjectPrefix}Ec2EcsInstanceAutoScalingGroup
+      LaunchTemplate:
+        LaunchTemplateId: !Ref EcsInstanceLaunchTemplate
+        Version: !GetAtt EcsInstanceLaunchTemplate.LatestVersionNumber
+      MinSize: !Ref EcsInstanceMinSize
+      MaxSize: !Ref EcsInstanceMaxSize
+      DesiredCapacity: !Ref EcsInstanceDesiredCapacity
+      HealthCheckType: EC2
+      HealthCheckGracePeriod: 60
+      VPCZoneIdentifier:
+        - !Ref PublicSubnetAId
+        - !Ref PublicSubnetCId
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectPrefix}Ec2EcsInstance
+          PropagateAtLaunch: true
+
+  # ------------------------------------------------------------#
+  # ECS Task Definition
+  # ------------------------------------------------------------#
+  EcsAppTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    DependsOn:
+      - EcsAppContainerLogGroup
+    Properties:
+      ContainerDefinitions:
+        - Essential: true
+          Image: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EcsAppImageName}:latest
+          # ECS version consistency defaults to enabled, which resolves the :latest
+          # tag to an image digest when the task definition revision is REGISTERED
+          # and pins it. Every task from that revision then keeps using the old
+          # digest no matter how many times you push :latest, which silently makes
+          # you test stale code. Disabled here so the tag is resolved at task
+          # launch instead, which is what an iterative test loop needs.
+          VersionConsistency: disabled
+          # Only needed to receive traffic from the ALB. The log generator does
+          # not depend on any inbound connection.
+          # PortMappings:
+          #   # HostPort 0 means the host port is chosen dynamically from the
+          #   # ephemeral port range, which is the usual EC2 launch type pattern.
+          #   - ContainerPort: !Ref EcsAppContainerPort
+          #     HostPort: 0
+          #     Protocol: tcp
+          LogConfiguration: !If
+            - UseJsonFileLogDriver
+            - LogDriver: json-file
+              # Without Options the log is not rotated and grows unbounded
+              Options: !If
+                - RotateJsonFileLog
+                - max-size: !Ref JsonFileLogMaxSize
+                  max-file: !Ref JsonFileLogMaxFile
+                - !Ref AWS::NoValue
+            - LogDriver: awslogs
+              Options:
+                awslogs-group: !Ref EcsAppContainerLogGroup
+                awslogs-region: !Sub ${AWS::Region}
+                awslogs-stream-prefix: ecs
+          # The application writes its log files here, and this path is bind
+          # mounted to the host. This is the path that actually fills the disk,
+          # and it is outside /var/lib/docker entirely.
+          MountPoints:
+            - ContainerPath: !Ref HostLogPath
+              SourceVolume: logs
+          Name: !Sub ${ProjectPrefix}${EcsAppContainerName}
+      Cpu: !Ref EcsAppTaskCpu
+      ExecutionRoleArn: !GetAtt EcsTaskRole.Arn
+      Family: !Sub ${EcsAppTaskName}-ec2
+      Memory: !Ref EcsAppTaskMemory
+      NetworkMode: bridge
+      RequiresCompatibilities:
+        - EC2
+      TaskRoleArn: !GetAtt EcsTaskRole.Arn
+      # A bind mount with host.sourcePath. Per the ECS API reference the data
+      # "persists at the specified location on the host container instance until
+      # you delete it manually", so neither Docker nor the ECS agent ever removes
+      # it. ECS_ENGINE_TASK_CLEANUP_WAIT_DURATION does not apply to this path.
+      Volumes:
+        - Name: logs
+          Host:
+            SourcePath: !Ref HostLogPath
+  # ------------------------------------------------------------#
+  # ECS Service
+  # ------------------------------------------------------------#
+  EcsAppService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      # - Listener
+      - EcsInstanceAutoScalingGroup
+    Properties:
+      Cluster: !Ref EcsCluster
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 100
+      DeploymentController:
+        Type: ECS
+      DesiredCount: !Ref EcsAppDesiredCount
+      EnableExecuteCommand: true
+      # Only meaningful together with a load balancer or a container health check
+      # HealthCheckGracePeriodSeconds: 60
+      LaunchType: EC2
+      # LoadBalancers is NOT a required property of AWS::ECS::Service.
+      # Without it the service simply keeps DesiredCount tasks running and
+      # registers nothing with a load balancer.
+      # LoadBalancers:
+      #   - ContainerName: !Sub ${ProjectPrefix}${EcsAppContainerName}
+      #     ContainerPort: !Ref EcsAppContainerPort
+      #     TargetGroupArn: !Ref TargetGroup
+      SchedulingStrategy: REPLICA
+      ServiceName: !Sub ${ProjectPrefix}Ec2${EcsAppServiceName}
+      TaskDefinition: !Ref EcsAppTaskDefinition
+  # ------------------------------------------------------------#
+  # Auto Scaling Service  --  NOT REQUIRED for this verification
+  #
+  # Target tracking on average CPU would change the task count while the test is
+  # running, and the log loop in main.py is what drives that CPU. The disk growth
+  # rate would then move on its own. Keep the count fixed with EcsAppDesiredCount
+  # instead.
+  # ------------------------------------------------------------#
+  # EcsAppServiceScalingTarget:
+  #   Type: AWS::ApplicationAutoScaling::ScalableTarget
+  #   DependsOn:
+  #     - EcsAppService
+  #   Properties:
+  #     MinCapacity: !Ref TaskMinContainerCount
+  #     MaxCapacity: !Ref TaskMaxContainerCount
+  #     ResourceId: !Join
+  #       - /
+  #       - - service
+  #         - !Ref EcsCluster
+  #         - !GetAtt EcsAppService.Name
+  #     ScalableDimension: ecs:service:DesiredCount
+  #     ServiceNamespace: ecs
+  # EcsAppServiceScalingPolicy:
+  #   Type: AWS::ApplicationAutoScaling::ScalingPolicy
+  #   DependsOn:
+  #     - EcsAppServiceScalingTarget
+  #   Properties:
+  #     PolicyName: !Sub ${ProjectPrefix}Ec2${EcsAppServiceName}-ScalingPolicy
+  #     PolicyType: TargetTrackingScaling
+  #     ScalingTargetId: !Ref EcsAppServiceScalingTarget
+  #     TargetTrackingScalingPolicyConfiguration:
+  #       DisableScaleIn: false
+  #       PredefinedMetricSpecification:
+  #         PredefinedMetricType: ECSServiceAverageCPUUtilization
+  #       ScaleInCooldown: 60
+  #       ScaleOutCooldown: 60
+  #       TargetValue: 70.0
+  # ------------------------------------------------------------#
+  # IAM
+  # ------------------------------------------------------------#
+  # Role assumed by the container instances. AmazonEC2ContainerServiceforEC2Role
+  # lets the ECS agent register with the cluster, AmazonSSMManagedInstanceCore
+  # lets you log in with Session Manager to inspect the host disk.
+  EcsInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Path: /
+      RoleName: !Sub ${ProjectPrefix}EcsOnEc2InstanceRole
+  EcsInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub ${ProjectPrefix}EcsOnEc2InstanceProfile
+      Path: /
+      Roles:
+        - !Ref EcsInstanceRole
+  EcsTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess
+      Path: /
+      RoleName: !Sub ${ProjectPrefix}EcsOnEc2TaskRole
+# ------------------------------------------------------------#
+# Outputs
+# ------------------------------------------------------------#
+Outputs:
+  # AlbDnsName:
+  #   Value: !GetAtt ALB.DNSName
+  EcsClusterName:
+    Value: !Ref EcsCluster
+  EcsServiceName:
+    Value: !GetAtt EcsAppService.Name
+  AutoScalingGroupName:
+    Value: !Ref EcsInstanceAutoScalingGroup
+  ContainerInstanceAmiId:
+    Value: !Ref EcsInstanceAmiId
