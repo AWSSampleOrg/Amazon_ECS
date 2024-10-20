@@ -1,0 +1,188 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: ECS on Fargate
+# ------------------------------------------------------------#
+# Input Parameters
+# ------------------------------------------------------------#
+Parameters:
+  ProjectPrefix:
+    Type: String
+    Default: ""
+
+  # VPC
+  VpcId:
+    Type: String
+  PublicSubnetAId:
+    Type: String
+  PublicSubnetCId:
+    Type: String
+
+  # ECS
+  # Cluster
+  EcsClusterName:
+    Type: String
+    Default: Cluster
+  # Task Definition
+  EcsAppTaskName:
+    Type: String
+    Default: app
+  # Image
+  EcsAppImageName:
+    Type: String
+    Default: app
+  # Container
+  DefaultLogLevel:
+    Type: String
+    Default: DEBUG
+  EcsAppContainerName:
+    Type: String
+    Default: app
+
+Resources:
+  # ------------------------------------------------------------#
+  # Security Groups for ECS Task
+  # ------------------------------------------------------------#
+  SecurityGroupForAppTask:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${ProjectPrefix}SecurityGroupForAppTask
+      GroupDescription: This is for SecurityGroupForAppTask
+      VpcId: !Ref VpcId
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectPrefix}SecurityGroupForAppTask
+
+  # ------------------------------------------------------------#
+  # Cloud Watch Log Group
+  # ------------------------------------------------------------#
+  EcsAppContainerLogGroup:
+    Type: "AWS::Logs::LogGroup"
+    Properties:
+      LogGroupName: !Sub /ecs/logs/${ProjectPrefix}${EcsAppContainerName}
+
+  # ------------------------------------------------------------#
+  # ECS
+  # ------------------------------------------------------------#
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub ${ProjectPrefix}${EcsClusterName}
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectPrefix}${EcsClusterName}
+
+  EcsAppTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    DependsOn:
+      - EcsAppContainerLogGroup
+    Properties:
+      ContainerDefinitions:
+        #app
+        - Essential: true
+          Environment:
+            - Name: LOG_LEVEL
+              Value: !Sub ${DefaultLogLevel}
+            - Name: DefaultRegion
+              Value: !Sub ${AWS::Region}
+          Image: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EcsAppImageName}:latest
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref EcsAppContainerLogGroup
+              awslogs-region: !Sub ${AWS::Region}
+              awslogs-stream-prefix: ecs
+          Name: !Sub ${ProjectPrefix}${EcsAppContainerName}
+      Cpu: 256
+      ExecutionRoleArn: !Sub ${EcsTaskRole.Arn}
+      Family: !Sub ${EcsAppTaskName}
+      Memory: 512
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      TaskRoleArn: !Sub ${EcsTaskRole.Arn}
+
+  # ------------------------------------------------------------#
+  # IAM
+  # ------------------------------------------------------------#
+  EcsTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess
+      Path: /
+      RoleName: !Sub ${ProjectPrefix}EcsTaskRole
+
+  StepFunctionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - states.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess
+      Path: /
+      RoleName: !Sub ${ProjectPrefix}StepFunctionsRole
+
+  # ------------------------------------------------------------#
+  # Step Function
+  # ------------------------------------------------------------#
+  StepFunctions:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub ${ProjectPrefix}run-task-state
+      DefinitionString: !Sub |-
+        {
+          "Comment": "Comprehend Tutorial state machine",
+          "StartAt": "RunTask",
+          "TimeoutSeconds": 3600,
+          "States": {
+            "RunTask": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::ecs:runTask.sync",
+              "Parameters": {
+                "LaunchType": "FARGATE",
+                "Cluster": "${EcsCluster.Arn}",
+                "TaskDefinition": "${EcsAppTaskDefinition}",
+                "NetworkConfiguration": {
+                  "AwsvpcConfiguration": {
+                    "Subnets": [
+                      "${PublicSubnetAId}",
+                      "${PublicSubnetCId}"
+                    ],
+                    "SecurityGroups": [
+                      "${SecurityGroupForAppTask}"
+                    ],
+                    "AssignPublicIp": "ENABLED"
+                  }
+                },
+                "Overrides": {
+                  "ContainerOverrides": [
+                    {
+                      "Name": "app"
+                    }
+                  ]
+                }
+              },
+              "End": true
+            }
+          }
+        }
+      RoleArn: !Sub ${StepFunctionsRole.Arn}

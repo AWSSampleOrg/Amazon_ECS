@@ -1,0 +1,447 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: ECS on Fargate
+# ------------------------------------------------------------#
+# Input Parameters
+# ------------------------------------------------------------#
+Parameters:
+  ProjectPrefix:
+    Type: String
+    Default: ""
+
+  # VPC
+  VpcId:
+    Type: String
+  PublicSubnetAId:
+    Type: String
+  PublicSubnetCId:
+    Type: String
+
+  # ECS
+  # Cluster
+  EcsClusterName:
+    Type: String
+    Default: Cluster
+  # Service
+  EcsAppServiceName:
+    Type: String
+    Default: Application
+  EcsWebServiceName:
+    Type: String
+    Default: WebServer
+  # Task Definition
+  EcsWebTaskName:
+    Type: String
+    Default: web
+  EcsAppTaskName:
+    Type: String
+    Default: app
+  # Image
+  EcsWebImageName:
+    Type: String
+    Default: web
+  EcsAppImageName:
+    Type: String
+    Default: app
+  # Container
+  DefaultLogLevel:
+    Type: String
+    Default: DEBUG
+  EcsWebContainerName:
+    Type: String
+    Default: web
+  EcsWebContainerPort:
+    Type: Number
+    Default: 80
+  EcsAppContainerName:
+    Type: String
+    Default: app
+  EcsAppContainerPort:
+    Type: Number
+    Default: 3000
+  # ServiceAutoScaling
+  ServiceScaleEvaluationPeriods:
+    Type: Number
+    Default: 2
+  ServiceCpuScaleOutThreshold:
+    Type: Number
+    Default: 50
+  ServiceCpuScaleInThreshold:
+    Type: Number
+    Default: 25
+  TaskMinContainerCount:
+    Type: Number
+    Default: 1
+  TaskMaxContainerCount:
+    Type: Number
+    Default: 2
+
+Resources:
+  # ------------------------------------------------------------#
+  # ALB
+  # ------------------------------------------------------------#
+  SecurityGroupForALB:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${ProjectPrefix}SecurityGroupForALB
+      GroupDescription: This is for SecurityGroupForALB
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - CidrIp: "0.0.0.0/0"
+          Description: This is for ALB
+          FromPort: 80
+          IpProtocol: tcp
+          ToPort: 80
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectPrefix}SecurityGroupForALB
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - TargetGroupArn: !Ref TargetGroup
+          Type: forward
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP
+
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      IpAddressType: ipv4
+      Name: !Sub ${ProjectPrefix}LoadBalancer
+      Scheme: internet-facing
+      SecurityGroups:
+        - !Ref SecurityGroupForALB
+      Subnets:
+        - !Ref PublicSubnetAId
+        - !Ref PublicSubnetCId
+      Type: application
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckEnabled: true
+      HealthCheckIntervalSeconds: 60
+      HealthCheckPath: /healthcheck
+      HealthCheckPort: traffic-port
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 30
+      HealthyThresholdCount: 5
+      Matcher:
+        HttpCode: 200-301
+      Name: !Sub ${ProjectPrefix}TargetGroup
+      Port: !Ref EcsWebContainerPort
+      Protocol: HTTP
+      TargetType: ip
+      UnhealthyThresholdCount: 3
+      VpcId: !Ref VpcId
+
+  # ------------------------------------------------------------#
+  # Cloud Map
+  # ------------------------------------------------------------#
+  PrivateNamespace:
+    Type: AWS::ServiceDiscovery::PrivateDnsNamespace
+    Properties:
+      Name: !Sub "${ProjectPrefix}NameSpace"
+      Vpc: !Ref VpcId
+
+  DiscoveryService:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Description: Discovery Service for the Demo Application
+      DnsConfig:
+        RoutingPolicy: MULTIVALUE
+        DnsRecords:
+          - TTL: 60
+            Type: A
+          - TTL: 60
+            Type: SRV
+      HealthCheckCustomConfig:
+        FailureThreshold: 1
+      Name: !Sub ${ProjectPrefix}${EcsAppServiceName}
+      NamespaceId: !Ref PrivateNamespace
+  # ------------------------------------------------------------#
+  # Cloud Watch Log Group
+  # ------------------------------------------------------------#
+  EcsWebContainerLogGroup:
+    Type: "AWS::Logs::LogGroup"
+    Properties:
+      LogGroupName: !Sub /ecs/logs/${ProjectPrefix}${EcsWebContainerName}
+
+  EcsAppContainerLogGroup:
+    Type: "AWS::Logs::LogGroup"
+    Properties:
+      LogGroupName: !Sub /ecs/logs/${ProjectPrefix}${EcsAppContainerName}
+
+  # ------------------------------------------------------------#
+  # Security Groups for ECS Service
+  # ------------------------------------------------------------#
+  SecurityGroupForWebService:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${ProjectPrefix}SecurityGroupForWebService
+      GroupDescription: This is for SecurityGroupForWebService
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - FromPort: !Ref EcsWebContainerPort
+          IpProtocol: tcp
+          SourceSecurityGroupId: !Ref SecurityGroupForALB
+          ToPort: !Ref EcsWebContainerPort
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectPrefix}SecurityGroupForWebService
+
+  SecurityGroupForAppService:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${ProjectPrefix}SecurityGroupForAppService
+      GroupDescription: This is for SecurityGroupForAppService
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - FromPort: !Ref EcsAppContainerPort
+          IpProtocol: tcp
+          SourceSecurityGroupId: !Ref SecurityGroupForWebService
+          ToPort: !Ref EcsAppContainerPort
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectPrefix}SecurityGroupForAppService
+
+  # ------------------------------------------------------------#
+  # ECS
+  # ------------------------------------------------------------#
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub ${ProjectPrefix}${EcsClusterName}
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectPrefix}${EcsClusterName}
+
+  # Web
+  EcsWebTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    DependsOn:
+      - EcsWebContainerLogGroup
+    Properties:
+      ContainerDefinitions:
+        #Web
+        - Essential: true
+          Environment:
+            - Name: SERVER_NAME
+              Value: !Join
+                - ""
+                - - !Sub ${ProjectPrefix}${EcsAppServiceName}
+                  - "."
+                  - !Sub ${ProjectPrefix}NameSpace
+          Image: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EcsWebImageName}:latest
+          PortMappings:
+            - ContainerPort: !Ref EcsWebContainerPort
+              HostPort: !Ref EcsWebContainerPort
+              Protocol: tcp
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref EcsWebContainerLogGroup
+              awslogs-region: !Sub ${AWS::Region}
+              awslogs-stream-prefix: ecs
+          Name: !Sub ${ProjectPrefix}${EcsWebContainerName}
+      Cpu: 256
+      ExecutionRoleArn: !Sub ${EcsTaskRole.Arn}
+      Family: !Sub ${EcsWebTaskName}
+      Memory: 512
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      TaskRoleArn: !Sub ${EcsTaskRole.Arn}
+
+  EcsWebService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - Listener
+    Properties:
+      Cluster: !Ref EcsCluster
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 100
+      DeploymentController:
+        # Type: CODE_DEPLOY #Blue/Green Deploy
+        Type: ECS
+      DesiredCount: 1
+      EnableExecuteCommand: true
+      HealthCheckGracePeriodSeconds: 600
+      LaunchType: FARGATE
+      LoadBalancers:
+        - ContainerName: !Sub ${ProjectPrefix}${EcsWebContainerName}
+          ContainerPort: !Ref EcsWebContainerPort
+          TargetGroupArn: !Ref TargetGroup
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups:
+            - !Ref SecurityGroupForWebService
+          Subnets:
+            - !Ref PublicSubnetAId
+            - !Ref PublicSubnetCId
+      PlatformVersion: LATEST
+      SchedulingStrategy: REPLICA
+      ServiceName: !Sub ${ProjectPrefix}${EcsWebServiceName}
+      TaskDefinition: !Ref EcsWebTaskDefinition
+
+  # Application
+  EcsAppTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    DependsOn:
+      - EcsAppContainerLogGroup
+    Properties:
+      ContainerDefinitions:
+        #app
+        - Essential: true
+          Environment:
+            - Name: LOG_LEVEL
+              Value: !Sub ${DefaultLogLevel}
+            - Name: DefaultRegion
+              Value: !Sub ${AWS::Region}
+          Image: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EcsAppImageName}:latest
+          PortMappings:
+            - ContainerPort: !Ref EcsAppContainerPort
+              HostPort: !Ref EcsAppContainerPort
+              Protocol: tcp
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref EcsAppContainerLogGroup
+              awslogs-region: !Sub ${AWS::Region}
+              awslogs-stream-prefix: ecs
+          Name: !Sub ${ProjectPrefix}${EcsAppContainerName}
+      Cpu: 256
+      ExecutionRoleArn: !Sub ${EcsTaskRole.Arn}
+      Family: !Sub ${EcsAppTaskName}
+      Memory: 512
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      TaskRoleArn: !Sub ${EcsTaskRole.Arn}
+
+  EcsAppService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - Listener
+    Properties:
+      Cluster: !Ref EcsCluster
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 100
+      DeploymentController:
+        # Type: CODE_DEPLOY #Blue/Green Deploy
+        Type: ECS
+      DesiredCount: 1
+      EnableExecuteCommand: true
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups:
+            - !Ref SecurityGroupForAppService
+          Subnets:
+            - !Ref PublicSubnetAId
+            - !Ref PublicSubnetCId
+      PlatformVersion: LATEST
+      SchedulingStrategy: REPLICA
+      ServiceName: !Sub ${ProjectPrefix}${EcsAppServiceName}
+      TaskDefinition: !Ref EcsAppTaskDefinition
+      ServiceRegistries:
+        - RegistryArn: !GetAtt DiscoveryService.Arn
+          Port: !Ref EcsAppContainerPort
+  # ------------------------------------------------------------#
+  # Auto Scaling Service
+  # ------------------------------------------------------------#
+  # Web
+  EcsWebServiceScalingTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    DependsOn:
+      - EcsWebService
+    Properties:
+      MinCapacity: !Ref TaskMinContainerCount
+      MaxCapacity: !Ref TaskMaxContainerCount
+      ResourceId: !Join
+        - /
+        - - service
+          - !Ref EcsCluster
+          - !GetAtt EcsWebService.Name
+      RoleARN: !Sub ${EcsTaskRole.Arn}
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+
+  EcsWebServiceScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    DependsOn:
+      - EcsWebServiceScalingTarget
+    Properties:
+      PolicyName: !Sub "${ProjectPrefix}${EcsWebServiceName}-ScalingPolicy"
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref EcsWebServiceScalingTarget
+      TargetTrackingScalingPolicyConfiguration:
+        DisableScaleIn: false
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        ScaleInCooldown: 60
+        ScaleOutCooldown: 60
+        TargetValue: 70.0
+
+  # Application
+  EcsAppServiceScalingTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    DependsOn:
+      - EcsAppService
+    Properties:
+      MinCapacity: !Ref TaskMinContainerCount
+      MaxCapacity: !Ref TaskMaxContainerCount
+      ResourceId: !Join
+        - /
+        - - service
+          - !Ref EcsCluster
+          - !GetAtt EcsAppService.Name
+      RoleARN: !Sub ${EcsTaskRole.Arn}
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+
+  EcsAppServiceScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    DependsOn:
+      - EcsAppServiceScalingTarget
+    Properties:
+      PolicyName: !Sub "${ProjectPrefix}${EcsAppServiceName}-ScalingPolicy"
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref EcsAppServiceScalingTarget
+      TargetTrackingScalingPolicyConfiguration:
+        DisableScaleIn: false
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        ScaleInCooldown: 60
+        ScaleOutCooldown: 60
+        TargetValue: 70.0
+
+  # ------------------------------------------------------------#
+  # IAM
+  # ------------------------------------------------------------#
+  EcsTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess
+      Path: /
+      RoleName: !Sub ${ProjectPrefix}EcsTaskRole
